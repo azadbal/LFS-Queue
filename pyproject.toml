@@ -1,0 +1,15 @@
+[project]
+name = "lfs_queue"
+version = "0.1.0"
+description = "Queue multiple Lift Studio training variants from one dataset snapshot."
+readme = "README.md"
+requires-python = ">=3.12"
+authors = [
+    { name = "Azad" },
+]
+
+[tool.lichtfeld]
+hot_reload = true
+plugin_api = ">=1,<2"
+lichtfeld_version = ">=0.4.2"
+required_features = []
