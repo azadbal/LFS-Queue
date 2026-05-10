@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import json
 from pathlib import Path
+import shutil
 import tempfile
 import threading
 import time
@@ -13,26 +14,48 @@ from uuid import uuid4
 
 import lichtfeld as lf
 
-from .queue_core import (
-    build_runtime_state,
-    CompletionDecision,
-    QueueJob,
-    RUNNABLE_STATUSES,
-    STATUS_COMPLETED,
-    STATUS_FAILED,
-    STATUS_INTERRUPTED,
-    STATUS_LOADING,
-    STATUS_TRAINING,
-    classify_training_end,
-    deserialize_queue_state,
-    find_next_runnable_job_index,
-    is_trainer_ready_state,
-    make_job_output_dir,
-    next_model_name,
-    normalize_path,
-    serialize_queue_state,
-    should_finalize_training_end,
-)
+try:
+    from .queue_core import (
+        build_runtime_state,
+        CompletionDecision,
+        QueueJob,
+        RUNNABLE_STATUSES,
+        STATUS_COMPLETED,
+        STATUS_FAILED,
+        STATUS_INTERRUPTED,
+        STATUS_LOADING,
+        STATUS_TRAINING,
+        classify_training_end,
+        deserialize_queue_state,
+        find_next_runnable_job_index,
+        is_trainer_ready_state,
+        make_job_output_dir,
+        next_model_name,
+        normalize_path,
+        serialize_queue_state,
+        should_finalize_training_end,
+    )
+except ImportError:
+    from queue_core import (
+        build_runtime_state,
+        CompletionDecision,
+        QueueJob,
+        RUNNABLE_STATUSES,
+        STATUS_COMPLETED,
+        STATUS_FAILED,
+        STATUS_INTERRUPTED,
+        STATUS_LOADING,
+        STATUS_TRAINING,
+        classify_training_end,
+        deserialize_queue_state,
+        find_next_runnable_job_index,
+        is_trainer_ready_state,
+        make_job_output_dir,
+        next_model_name,
+        normalize_path,
+        serialize_queue_state,
+        should_finalize_training_end,
+    )
 
 
 PLUGIN_ID = "lfs_queue"
@@ -40,9 +63,10 @@ SETTINGS_KEY = "queue_state"
 MUTABLE_DATASET_FIELDS = ("resize_factor", "max_width", "use_cpu_cache", "use_fs_cache")
 DEBUG_EVENT_LIMIT = 250
 DEBUG_TRACE_PATH = Path(__file__).resolve().parent / "live_queue_debug_trace.jsonl"
-LOAD_READY_TIMEOUT_SECONDS = 30.0
-LOAD_READY_POLL_SECONDS = 0.1
 TRAINING_POLL_SECONDS = 0.1
+QUEUE_ADVANCE_DELAY_SECONDS = 0.25
+QUEUE_READY_TIMEOUT_SECONDS = 60.0
+QUEUE_READY_POLL_SECONDS = 0.25
 
 OPTIMIZATION_KEY_REPLAY_MAP = {
     "iterations": "iterations",
@@ -114,13 +138,13 @@ class QueueController:
         self._run_token = 0
         self._training_started_observed = False
         self._finish_reason_baseline = ""
-        self._dataset_event_baseline_seq = 0
         self._runtime_event_baseline_seq = 0
         self._runtime_event_consumed_seq = 0
         self._training_handlers = lf.ScopedHandler()
         self._training_handlers.on_training_start(self._handle_training_start)
         self._training_handlers.on_training_end(self._handle_training_end)
-        self._preserved_models: dict[str, dict[str, Any]] = {}
+        self._completed_output_paths: dict[str, str] = {}
+        self._native_artifact_baselines: dict[str, dict[str, float]] = {}
         self._reset_debug_trace()
         if persisted_jobs:
             self._record_event("persisted_jobs_discarded", jobs=len(persisted_jobs))
@@ -142,6 +166,9 @@ class QueueController:
     @property
     def is_running(self) -> bool:
         return self._active_job_id is not None
+
+    def can_add_current_job(self) -> bool:
+        return self._native_start_training_ready()
 
     def export_state(self) -> dict[str, Any]:
         state = build_runtime_state(
@@ -175,7 +202,17 @@ class QueueController:
         self._release_frame_callback()
 
     def add_current_job(self) -> bool:
-        self._record_event("add_current_requested")
+        ready = self.can_add_current_job()
+        self._record_event(
+            "queue.add_attempt",
+            ready=ready,
+            has_trainer=self._has_trainer(),
+            trainer_state=self._trainer_state(),
+        )
+        if not ready:
+            self._record_event("queue.add_blocked_not_ready")
+            self._set_status("Add to Queue is available when LFS Start Training is available.", error=True)
+            return False
         try:
             config_json = self._capture_current_config()
             dataset_path, base_output_dir, dataset_overrides = self._capture_dataset_snapshot()
@@ -202,7 +239,7 @@ class QueueController:
         self._jobs.append(job)
         self._persist()
         self._record_event(
-            "job_added",
+            "queue.job_added",
             job_id=job.id,
             label=job.label,
             dataset_path=job.dataset_path,
@@ -290,7 +327,7 @@ class QueueController:
             return False
 
         self._auto_run = False
-        self._record_event("run_selected_requested", job_id=job.id, label=job.label)
+        self._record_event("queue.run_selected_requested", job_id=job.id, label=job.label)
         return self._start_job(job)
 
     def run_all_pending(self) -> bool:
@@ -304,7 +341,7 @@ class QueueController:
             return False
 
         self._auto_run = True
-        self._record_event("run_all_requested", start_job_id=self._jobs[next_index].id)
+        self._record_event("queue.run_all_requested", start_job_id=self._jobs[next_index].id)
         return self._start_job(self._jobs[next_index])
 
     def stop_queue(self) -> bool:
@@ -319,7 +356,7 @@ class QueueController:
         active_job = self.active_job
         if active_job is not None and active_job.status == STATUS_LOADING:
             current_index = self._job_index(active_job.id)
-            self._mark_job(active_job, STATUS_INTERRUPTED, error="Queue stopped during dataset reload.")
+            self._mark_job(active_job, STATUS_INTERRUPTED, error="Queue stopped before training started.")
             self._finish_current_job(current_index=current_index)
         else:
             try:
@@ -347,6 +384,8 @@ class QueueController:
     def _start_job(self, job: QueueJob) -> bool:
         try:
             Path(job.job_output_dir).mkdir(parents=True, exist_ok=True)
+            if not self._dataset_ready(job):
+                raise RuntimeError("The queued dataset is no longer the active LFS dataset.")
             job.status = STATUS_LOADING
             job.error = ""
             job.last_run_at = self._timestamp()
@@ -356,12 +395,12 @@ class QueueController:
             self._run_token += 1
             self._training_started_observed = False
             self._finish_reason_baseline = ""
-            self._dataset_event_baseline_seq = 0
             self._runtime_event_baseline_seq = 0
             self._runtime_event_consumed_seq = 0
-            self._phase = "loading"
+            self._native_artifact_baselines[job.id] = self._snapshot_native_artifacts(job.base_output_dir)
+            self._phase = "starting"
             self._persist()
-            self._set_status(f"Loading dataset for {job.label}...")
+            self._set_status(f"Starting {job.label}...")
             lf.log.info(
                 f"{PLUGIN_ID}: starting job {job.label}; "
                 f"dataset={job.dataset_path}; "
@@ -369,7 +408,7 @@ class QueueController:
                 f"job_output={job.job_output_dir}"
             )
             self._record_event(
-                "job_starting",
+                "queue.job_started",
                 job_id=job.id,
                 label=job.label,
                 dataset_path=job.dataset_path,
@@ -378,86 +417,21 @@ class QueueController:
                 auto_run=self._auto_run,
                 run_token=self._run_token,
             )
-            self._record_event(
-                "load_file_begin",
-                job_id=job.id,
-                label=job.label,
-                dataset_path=job.dataset_path,
-                job_output_dir=job.job_output_dir,
-            )
-            self._dataset_event_baseline_seq = self._latest_runtime_event_sequence_for("dataset.load_completed")
-            lf.load_file(job.dataset_path, is_dataset=True, output_path=job.job_output_dir)
-            self._record_event(
-                "load_file_returned",
-                job_id=job.id,
-                label=job.label,
-                dataset_path=job.dataset_path,
-                job_output_dir=job.job_output_dir,
-                dataset_event_baseline_seq=self._dataset_event_baseline_seq,
-            )
             if self._job_ready_to_start(job):
-                self._record_event("dataset_ready_after_load", job_id=job.id, label=job.label)
-                self._begin_training_for_job(job)
-            elif self._wait_for_job_ready(job):
-                self._record_event("dataset_ready_after_wait", job_id=job.id, label=job.label)
                 self._begin_training_for_job(job)
             else:
-                self._record_event(
-                    "dataset_waiting_for_poll",
-                    job_id=job.id,
-                    label=job.label,
-                    trainer_state=self._trainer_state(),
-                    has_trainer=self._has_trainer(),
-                )
-                self._start_load_poll_thread(job.id, self._run_token)
+                raise RuntimeError("LFS Start Training is not available for the active dataset.")
             return True
         except Exception as exc:
             self._active_job_id = None
             self._phase = "idle"
             job.status = STATUS_FAILED
-            job.error = f"Unable to load dataset: {exc}"
+            job.error = f"Unable to start job: {exc}"
             self._persist()
-            self._record_event("job_load_failed", job_id=job.id, label=job.label, error=str(exc))
+            self._record_event("queue.job_failed", job_id=job.id, label=job.label, error=str(exc))
             self._set_status(job.error, error=True)
             self._release_frame_callback()
             return False
-
-    def _wait_for_job_ready(self, job: QueueJob) -> bool:
-        self._record_event("job_ready_wait_begin", job_id=job.id, label=job.label)
-        deadline = time.monotonic() + LOAD_READY_TIMEOUT_SECONDS
-        checks = 0
-        while time.monotonic() < deadline:
-            checks += 1
-            if self._job_ready_to_start(job):
-                self._record_event("job_ready_wait_satisfied", job_id=job.id, label=job.label, checks=checks)
-                return True
-            time.sleep(LOAD_READY_POLL_SECONDS)
-        ready = self._job_ready_to_start(job)
-        self._record_event("job_ready_wait_timeout", job_id=job.id, label=job.label, checks=checks, ready=ready)
-        return ready
-
-    def _start_load_poll_thread(self, job_id: str, run_token: int) -> None:
-        self._record_event("load_poll_thread_started", job_id=job_id, run_token=run_token)
-        def worker() -> None:
-            while True:
-                active_job = self.active_job
-                if active_job is None or active_job.id != job_id or self._run_token != run_token:
-                    self._record_event("load_poll_thread_stopped", job_id=job_id, run_token=run_token)
-                    return
-                if self._phase != "loading":
-                    self._record_event("load_poll_thread_phase_exit", job_id=job_id, run_token=run_token, phase=self._phase)
-                    return
-                if self._job_ready_to_start(active_job):
-                    self._record_event("dataset_ready_after_poll", job_id=active_job.id, label=active_job.label)
-                    self._begin_training_for_job(active_job)
-                    return
-                time.sleep(LOAD_READY_POLL_SECONDS)
-
-        threading.Thread(
-            target=worker,
-            name=f"{PLUGIN_ID}-load-poll-{run_token}",
-            daemon=True,
-        ).start()
 
     def _handle_training_start(self, _payload: Any | None = None) -> None:
         active_job = self.active_job
@@ -516,23 +490,6 @@ class QueueController:
                     trainer_error=trainer_error,
                 )
             return
-        runtime_terminal_event = self._latest_runtime_terminal_training_event()
-        if runtime_terminal_event is not None:
-            runtime_sequence = int(runtime_terminal_event.get("sequence") or 0)
-            self._runtime_event_consumed_seq = runtime_sequence
-            self._record_event(
-                "training_end_hook_runtime_terminal",
-                job_id=(active_job.id if active_job is not None else ""),
-                label=(active_job.label if active_job is not None else ""),
-                runtime_event_type=str(runtime_terminal_event.get("type") or ""),
-                runtime_event_sequence=runtime_sequence,
-            )
-            self._finalize_active_job(
-                source="hook",
-                decision_override=self._completion_decision_from_runtime_event(runtime_terminal_event),
-            )
-            return
-
         terminal_detected = should_finalize_training_end(
             trainer_state=trainer_state,
             trainer_error=trainer_error,
@@ -569,8 +526,9 @@ class QueueController:
             stop_requested=self._stop_requested,
             auto_run=self._auto_run,
         )
+        self._phase = "finalizing"
         self._record_event(
-            "training_ended",
+            "queue.training_finished",
             job_id=active_job.id,
             label=active_job.label,
             source=source,
@@ -591,6 +549,8 @@ class QueueController:
                     continue_queue=decision.continue_queue,
                     error=preserve_error,
                 )
+            else:
+                self._claim_native_training_artifacts(active_job)
 
         current_index = self._job_index(active_job.id)
         self._mark_job(active_job, decision.status, error=decision.error)
@@ -609,13 +569,12 @@ class QueueController:
         self._stop_requested = False
         self._training_started_observed = False
         self._finish_reason_baseline = ""
-        self._dataset_event_baseline_seq = 0
         self._runtime_event_baseline_seq = 0
         self._runtime_event_consumed_seq = 0
         self._persist()
         self._release_frame_callback()
         self._record_event(
-            "job_finished",
+            "queue.job_finished",
             continue_queue=continue_queue,
             next_start_index=(0 if current_index is None else current_index + 1),
         )
@@ -624,10 +583,13 @@ class QueueController:
             start_index = 0 if current_index is None else current_index + 1
             next_index = find_next_runnable_job_index(self._jobs, start_index=start_index)
             if next_index is not None:
-                self._start_job(self._jobs[next_index])
+                self._record_event("queue.job_advance", next_job_id=self._jobs[next_index].id)
+                self._prepare_for_next_job()
+                self._defer_start_job(self._jobs[next_index])
                 return
 
         self._auto_run = False
+        self._load_completed_outputs()
         self._request_redraw()
 
     def _mark_job(self, job: QueueJob, status: str, *, error: str = "") -> None:
@@ -682,10 +644,9 @@ class QueueController:
 
     def _job_ready_to_start(self, job: QueueJob) -> bool:
         dataset_ready = self._dataset_ready(job)
-        load_completed, dataset_event_sequence = self._dataset_load_completed_since_baseline()
         has_trainer = self._has_trainer()
         trainer_state = self._trainer_state()
-        ready = dataset_ready and load_completed and is_trainer_ready_state(
+        ready = dataset_ready and is_trainer_ready_state(
             has_trainer=has_trainer,
             trainer_state=trainer_state,
         )
@@ -694,9 +655,6 @@ class QueueController:
             job_id=job.id,
             label=job.label,
             dataset_ready=dataset_ready,
-            dataset_load_completed=load_completed,
-            dataset_event_baseline_seq=self._dataset_event_baseline_seq,
-            dataset_event_sequence=dataset_event_sequence,
             has_trainer=has_trainer,
             trainer_state=trainer_state,
             ready=ready,
@@ -705,7 +663,6 @@ class QueueController:
 
     def _apply_job_config(self, job: QueueJob) -> None:
         self._record_event("job_config_apply_begin", job_id=job.id, label=job.label)
-        self._restore_preserved_models()
         optimization = lf.optimization_params()
         optimization_payload = job.config_json.get("optimization") or {}
         applied_keys: list[str] = []
@@ -808,14 +765,11 @@ class QueueController:
                 return
             self._training_started_observed = False
             self._finish_reason_baseline = str(lf.finish_reason() or "").strip()
-            self._runtime_event_baseline_seq = self._latest_runtime_training_event_sequence()
-            self._runtime_event_consumed_seq = self._runtime_event_baseline_seq
             self._record_event(
                 "start_training_begin",
                 job_id=job.id,
                 label=job.label,
                 finish_reason_baseline=self._finish_reason_baseline,
-                runtime_event_baseline_seq=self._runtime_event_baseline_seq,
             )
             lf.start_training()
             self._record_event(
@@ -825,7 +779,7 @@ class QueueController:
             )
             self._persist()
             self._record_event(
-                "training_started",
+                "queue.training_started",
                 job_id=job.id,
                 label=job.label,
                 run_token=self._run_token,
@@ -840,6 +794,66 @@ class QueueController:
             self._mark_job(job, STATUS_FAILED, error=f"Unable to start job: {exc}")
             self._set_status(f"Failed {job.label}: {job.error}", error=True)
             self._finish_current_job(continue_queue=self._auto_run, current_index=current_index)
+
+    def _defer_start_job(self, job: QueueJob) -> None:
+        job_id = job.id
+        run_token = self._run_token
+
+        def worker() -> None:
+            time.sleep(QUEUE_ADVANCE_DELAY_SECONDS)
+            next_job = self.get_job_by_id(job_id)
+            if next_job is None or self.is_running or not self._auto_run:
+                return
+            if not self._wait_for_native_start_ready(job_id=job_id, previous_run_token=run_token):
+                if next_job.status in RUNNABLE_STATUSES:
+                    next_job.status = STATUS_FAILED
+                    next_job.error = "Timed out waiting for LFS Start Training to become available."
+                    self._record_event("queue.job_failed", job_id=job_id, label=next_job.label, error=next_job.error)
+                    self._set_status(f"Unable to start {next_job.label}: {next_job.error}", error=True)
+                self._auto_run = False
+                return
+            self._record_event("queue.deferred_start", job_id=job_id, previous_run_token=run_token)
+            self._start_job(next_job)
+
+        threading.Thread(
+            target=worker,
+            name=f"{PLUGIN_ID}-advance-{run_token}",
+            daemon=True,
+        ).start()
+
+    def _prepare_for_next_job(self) -> None:
+        try:
+            self._record_event("queue.reset_training_requested")
+            lf.reset_training()
+        except Exception as exc:
+            self._record_event("queue.reset_training_failed", error=str(exc))
+
+    def _wait_for_native_start_ready(self, *, job_id: str, previous_run_token: int) -> bool:
+        deadline = time.monotonic() + QUEUE_READY_TIMEOUT_SECONDS
+        checks = 0
+        while time.monotonic() < deadline:
+            checks += 1
+            if self.is_running or not self._auto_run:
+                return False
+            if self._native_start_training_ready():
+                self._record_event(
+                    "queue.ready_for_next_job",
+                    job_id=job_id,
+                    previous_run_token=previous_run_token,
+                    checks=checks,
+                    trainer_state=self._trainer_state(),
+                )
+                return True
+            time.sleep(QUEUE_READY_POLL_SECONDS)
+        self._record_event(
+            "queue.ready_for_next_job_timeout",
+            job_id=job_id,
+            previous_run_token=previous_run_token,
+            checks=checks,
+            trainer_state=self._trainer_state(),
+            has_trainer=self._has_trainer(),
+        )
+        return False
 
     def _start_training_poll_thread(self, job_id: str, run_token: int) -> None:
         def worker() -> None:
@@ -867,28 +881,27 @@ class QueueController:
         if not source_name:
             return "Unable to find the trained model in the scene."
 
-        desired_name = self._unique_scene_name(job.model_name)
+        output_path = str(Path(job.job_output_dir) / f"{job.model_name}.ply")
         try:
-            cached_model = self._capture_splat_node(source_name)
-            if cached_model is None:
-                return f"Unable to snapshot the trained model {source_name} for later restores."
-            duplicated_name = scene.duplicate_node(source_name)
-            renamed = scene.rename_node(duplicated_name, desired_name)
-            if not renamed:
-                return f"Duplicated {source_name}, but could not rename it to {desired_name}."
-            cached_model["name"] = desired_name
-            self._preserved_models[job.id] = cached_model
+            Path(job.job_output_dir).mkdir(parents=True, exist_ok=True)
+            node = scene.get_node(source_name)
+            if node is None:
+                return f"Unable to find trained model node {source_name}."
+            splat_data = node.splat_data()
+            if splat_data is None:
+                return f"Unable to read splat data from {source_name}."
+            lf.io.save_ply(splat_data, output_path)
+            self._completed_output_paths[job.id] = output_path
             self._record_event(
-                "model_preserved",
+                "queue.model_preserved",
                 job_id=job.id,
                 label=job.label,
                 source_name=source_name,
-                duplicated_name=duplicated_name,
-                desired_name=desired_name,
+                output_path=output_path,
             )
             return ""
         except Exception as exc:
-            return f"Unable to duplicate the trained model: {exc}"
+            return f"Unable to save trained model: {exc}"
 
     def _capture_splat_node(self, node_name: str) -> dict[str, Any] | None:
         scene = lf.get_scene()
@@ -909,32 +922,116 @@ class QueueController:
             "opacity": splat_data.opacity_raw.clone().cpu(),
         }
 
-    def _restore_preserved_models(self) -> None:
-        if not self._preserved_models:
+    def _load_completed_outputs(self) -> None:
+        if not self._completed_output_paths:
             return
+        loaded_paths: list[str] = []
+        try:
+            lf.switch_to_edit_mode()
+        except Exception as exc:
+            self._record_event("queue.switch_to_edit_mode_failed", error=str(exc))
+
+        self._remove_live_training_model()
+
+        for job in self._jobs:
+            if job.status != STATUS_COMPLETED:
+                continue
+            output_path = self._completed_output_paths.get(job.id, "")
+            if not output_path or not Path(output_path).exists():
+                continue
+            try:
+                lf.load_file(output_path)
+                loaded_paths.append(output_path)
+            except Exception as exc:
+                self._record_event("queue.output_load_failed", job_id=job.id, label=job.label, output_path=output_path, error=str(exc))
+
+        if loaded_paths:
+            self._record_event("queue.completed_outputs_loaded", paths=loaded_paths)
+
+    def _snapshot_native_artifacts(self, base_output_dir: str) -> dict[str, float]:
+        base_path = Path(base_output_dir)
+        paths = list(base_path.glob("splat_*.ply"))
+        paths.append(base_path / "checkpoints" / "checkpoint.resume")
+        snapshot: dict[str, float] = {}
+        for path in paths:
+            try:
+                if path.is_file():
+                    snapshot[str(path.resolve()).lower()] = path.stat().st_mtime
+            except OSError:
+                continue
+        return snapshot
+
+    def _is_new_or_updated_artifact(self, path: Path, baseline: dict[str, float]) -> bool:
+        try:
+            key = str(path.resolve()).lower()
+            current_mtime = path.stat().st_mtime
+        except OSError:
+            return False
+        previous_mtime = baseline.get(key)
+        return previous_mtime is None or current_mtime > previous_mtime + 0.001
+
+    def _claim_native_training_artifacts(self, job: QueueJob) -> None:
+        base_path = Path(job.base_output_dir)
+        job_path = Path(job.job_output_dir)
+        baseline = self._native_artifact_baselines.pop(job.id, {})
+        claimed: list[str] = []
+        removed: list[str] = []
+
+        checkpoint_path = base_path / "checkpoints" / "checkpoint.resume"
+        if checkpoint_path.is_file() and self._is_new_or_updated_artifact(checkpoint_path, baseline):
+            target_path = job_path / "checkpoints" / "checkpoint.resume"
+            try:
+                target_path.parent.mkdir(parents=True, exist_ok=True)
+                if target_path.exists():
+                    target_path.unlink()
+                shutil.move(str(checkpoint_path), str(target_path))
+                claimed.append(str(target_path))
+            except Exception as exc:
+                self._record_event(
+                    "queue.checkpoint_claim_failed",
+                    job_id=job.id,
+                    label=job.label,
+                    source_path=str(checkpoint_path),
+                    target_path=str(target_path),
+                    error=str(exc),
+                )
+
+        for splat_path in base_path.glob("splat_*.ply"):
+            if not splat_path.is_file() or not self._is_new_or_updated_artifact(splat_path, baseline):
+                continue
+            try:
+                splat_path.unlink()
+                removed.append(str(splat_path))
+            except Exception as exc:
+                self._record_event(
+                    "queue.native_splat_cleanup_failed",
+                    job_id=job.id,
+                    label=job.label,
+                    path=str(splat_path),
+                    error=str(exc),
+                )
+
+        if claimed or removed:
+            self._record_event(
+                "queue.native_artifacts_claimed",
+                job_id=job.id,
+                label=job.label,
+                claimed_paths=claimed,
+                removed_paths=removed,
+            )
+
+    def _remove_live_training_model(self) -> None:
         scene = lf.get_scene()
         if scene is None:
             return
-
-        restored_names: list[str] = []
-        for payload in self._preserved_models.values():
-            name = str(payload.get("name") or "").strip()
-            if not name or scene.get_node(name) is not None:
-                continue
-            scene.add_splat(
-                name,
-                means=payload["means"].cuda(),
-                sh0=payload["sh0"].cuda(),
-                shN=payload["shN"].cuda(),
-                scaling=payload["scaling"].cuda(),
-                rotation=payload["rotation"].cuda(),
-                opacity=payload["opacity"].cuda(),
-            )
-            restored_names.append(name)
-
-        if restored_names:
-            scene.notify_changed()
-            self._record_event("preserved_models_restored", names=restored_names)
+        source_name = self._find_training_model_name(scene)
+        if not source_name:
+            return
+        try:
+            lf.remove_node(source_name)
+            self._record_event("queue.live_training_model_removed", name=source_name)
+        except Exception as exc:
+            self._record_event("queue.live_training_model_remove_failed", name=source_name, error=str(exc))
 
     def _find_training_model_name(self, scene) -> str:
         candidates = []
@@ -1042,6 +1139,12 @@ class QueueController:
         except Exception:
             return ""
 
+    def _native_start_training_ready(self) -> bool:
+        return is_trainer_ready_state(
+            has_trainer=self._has_trainer(),
+            trainer_state=self._trainer_state(),
+        )
+
     def _validate_training_params(self) -> str:
         params = lf.optimization_params()
         if params is None:
@@ -1058,127 +1161,6 @@ class QueueController:
             return bool(getattr(lf.context(), "is_training", False))
         except Exception:
             return False
-
-    def _mcp_resource_payload(self, uri: str) -> dict[str, Any]:
-        try:
-            payload = lf.mcp.read_resource(uri)
-        except Exception as exc:
-            self._record_event("runtime_resource_read_failed", uri=uri, error=str(exc))
-            return {}
-
-        if isinstance(payload, dict):
-            text = payload.get("text")
-            if isinstance(text, str):
-                try:
-                    return json.loads(text)
-                except Exception:
-                    return {}
-            if "events" in payload or "jobs" in payload:
-                return payload
-            payload = payload.get("contents", payload)
-
-        if isinstance(payload, list):
-            for item in payload:
-                if isinstance(item, dict):
-                    text = item.get("text")
-                    if isinstance(text, str):
-                        try:
-                            return json.loads(text)
-                        except Exception:
-                            continue
-                    if "events" in item or "jobs" in item:
-                        return item
-                elif isinstance(item, str):
-                    try:
-                        return json.loads(item)
-                    except Exception:
-                        continue
-        return {}
-
-    def _runtime_training_events(self) -> list[dict[str, Any]]:
-        payload = self._mcp_resource_payload("lichtfeld://runtime/events")
-        events = payload.get("events") or []
-        return [event for event in events if isinstance(event, dict) and str(event.get("type") or "").startswith("training.")]
-
-    def _runtime_events(self) -> list[dict[str, Any]]:
-        payload = self._mcp_resource_payload("lichtfeld://runtime/events")
-        events = payload.get("events") or []
-        return [event for event in events if isinstance(event, dict)]
-
-    def _latest_runtime_event_sequence_for(self, event_type: str) -> int:
-        max_sequence = 0
-        for event in self._runtime_events():
-            if str(event.get("type") or "") != event_type:
-                continue
-            try:
-                max_sequence = max(max_sequence, int(event.get("sequence") or 0))
-            except Exception:
-                continue
-        return max_sequence
-
-    def _latest_runtime_training_event_sequence(self) -> int:
-        max_sequence = 0
-        for event in self._runtime_training_events():
-            try:
-                max_sequence = max(max_sequence, int(event.get("sequence") or 0))
-            except Exception:
-                continue
-        return max_sequence
-
-    def _latest_runtime_terminal_training_event(self) -> dict[str, Any] | None:
-        latest: dict[str, Any] | None = None
-        for event in self._runtime_training_events():
-            event_type = str(event.get("type") or "")
-            if event_type not in {"training.completed", "training.stopped"}:
-                continue
-            try:
-                sequence = int(event.get("sequence") or 0)
-            except Exception:
-                continue
-            if sequence <= self._runtime_event_consumed_seq:
-                continue
-            if latest is None or sequence > int(latest.get("sequence") or 0):
-                latest = event
-        return latest
-
-    def _completion_decision_from_runtime_event(self, event: dict[str, Any]) -> CompletionDecision:
-        event_type = str(event.get("type") or "")
-        data = event.get("data") or {}
-        if not isinstance(data, dict):
-            data = {}
-
-        if event_type == "training.stopped":
-            return CompletionDecision(status=STATUS_INTERRUPTED, continue_queue=False)
-
-        success = bool(data.get("success"))
-        user_stopped = bool(data.get("user_stopped"))
-        error = str(data.get("error") or "").strip()
-        iteration = int(data.get("iteration") or 0)
-        active_job = self.active_job
-        optimization = ((active_job.config_json or {}).get("optimization") or {}) if active_job is not None else {}
-        expected_iterations = int(optimization.get("iterations") or 0)
-
-        if not success or error:
-            return CompletionDecision(
-                status=STATUS_FAILED,
-                continue_queue=self._auto_run,
-                error=error or "Training failed.",
-            )
-        if user_stopped and self._stop_requested:
-            return CompletionDecision(status=STATUS_INTERRUPTED, continue_queue=False)
-        if user_stopped and expected_iterations and iteration < expected_iterations:
-            return CompletionDecision(
-                status=STATUS_INTERRUPTED,
-                continue_queue=False,
-                error=f"Training stopped unexpectedly at iteration {iteration} of {expected_iterations}.",
-            )
-        return CompletionDecision(status=STATUS_COMPLETED, continue_queue=self._auto_run)
-
-    def _dataset_load_completed_since_baseline(self) -> tuple[bool, int]:
-        latest_sequence = self._latest_runtime_event_sequence_for("dataset.load_completed")
-        if self._dataset_event_baseline_seq == 0:
-            return latest_sequence > 0, latest_sequence
-        return latest_sequence > self._dataset_event_baseline_seq, latest_sequence
 
     def _can_finalize_without_start(self) -> bool:
         if self._stop_requested:
@@ -1246,29 +1228,6 @@ class QueueController:
         if self._phase not in {"starting_training", "training"}:
             return
 
-        runtime_terminal_event = self._latest_runtime_terminal_training_event()
-        if runtime_terminal_event is not None:
-            runtime_sequence = int(runtime_terminal_event.get("sequence") or 0)
-            runtime_type = str(runtime_terminal_event.get("type") or "")
-            runtime_data = runtime_terminal_event.get("data") or {}
-            self._runtime_event_consumed_seq = runtime_sequence
-            self._record_event(
-                "runtime_training_terminal_detected",
-                job_id=job.id,
-                label=job.label,
-                run_token=self._run_token,
-                runtime_event_type=runtime_type,
-                runtime_event_sequence=runtime_sequence,
-                runtime_event_data=runtime_data,
-                trainer_state=trainer_state,
-                finish_reason=finish_reason,
-                trainer_error=trainer_error,
-            )
-            decision = self._completion_decision_from_runtime_event(runtime_terminal_event)
-            self._finalize_active_job(source="runtime", decision_override=decision)
-            return
-
-        finish_reason_changed = bool(finish_reason) and finish_reason != self._finish_reason_baseline
         terminal_detected = should_finalize_training_end(
             trainer_state=trainer_state,
             trainer_error=trainer_error,

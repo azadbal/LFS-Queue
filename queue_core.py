@@ -24,7 +24,7 @@ READY_TRAINER_STATES = {"idle", "ready"}
 TERMINAL_TRAINER_STATES = {"completed", "stopped", "error"}
 
 _INVALID_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]+')
-_MODEL_NAME_RE = re.compile(r"^model\s+(\d+)$", re.IGNORECASE)
+_MODEL_NAME_RE = re.compile(r"^model(?:[\s_-]+)(\d+)$", re.IGNORECASE)
 
 
 @dataclass(slots=True)
@@ -125,7 +125,7 @@ def next_model_name(existing_names: list[str]) -> str:
         match = _MODEL_NAME_RE.match(name.strip())
         if match:
             max_index = max(max_index, int(match.group(1)))
-    return f"model {max_index + 1}"
+    return f"model-{max_index + 1}"
 
 
 def normalize_path(path: str | Path) -> str:

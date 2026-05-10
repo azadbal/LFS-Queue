@@ -26,9 +26,36 @@ LichtFeld Studio (LFS) installations used alongside this repository are stored o
 - Stable: `C:\Users\Azad\Documents\_apps\LichtFeld_Studio\LFS_Stable`
 - Nightly: `C:\Users\Azad\Documents\_apps\LichtFeld_Studio\LFS_nightly`
 - Repo docs: `C:\Dev\3DGS\LichtFeld-Studio\docs`
+- LFS repo that you can build from source: `C:\Dev\3DGS\Lichtfeld-Studio-GH-REPO\LichtFeld-Studio`
 - General refs/docs: `C:\Dev\_docs`
+- example datasets to use to splat with: `C:\Dev\3DGS\_example_datasets\COLMAP-ready-datasets`
 
 Reference these exact paths in documentation or local workflow notes when a task depends on a specific build.
+
+## Host Repo Context
+For anything that depends on how LFS itself works, use the host repo as ground truth:
+
+- Host repo: `C:\Dev\3DGS\LichtFeld-Studio`
+- Check these first:
+  - `C:\Dev\3DGS\LichtFeld-Studio\docs`
+  - `C:\Dev\3DGS\LichtFeld-Studio\src\python`
+  - `C:\Dev\3DGS\LichtFeld-Studio\src\visualizer`
+
+Do not guess LFS APIs, training behavior, or UI extension points from memory when the host repo is available.
+
+For plugin UI integration work, search the host repo for:
+
+- `add_hook`
+- `training_panel.py`
+- `register_panel`
+- `ui.panel`
+
+For runtime/training behavior, search the host repo for:
+
+- `runtime/events`
+- `training.completed`
+- `training.stopped`
+- `dataset.load_completed`
 
 ## Low-Touch Execution
 Default expectation: the agent should handle build, test, live verification, evaluation, and iteration with minimal user involvement.
@@ -36,14 +63,15 @@ Default expectation: the agent should handle build, test, live verification, eva
 Preferred workflow for this repo:
 
 - Run local unit tests and script-based checks without asking the user to verify intermediate results.
-- When queue behavior depends on the live app, prefer the GUI MCP HTTP path over fragile in-process `--python-script` verification.
+- Do not rely on MCP for this project. MCP may exist in old code or historical notes, but it is not an accepted implementation or verification path.
+- When queue behavior depends on the live app, verify through the real LFS GUI/panel flow, local logs, trace artifacts, and direct host-repo/source inspection.
 - Use the stable LFS build first unless there is a specific reason to target nightly:
   - `C:\Users\Azad\Documents\_apps\LichtFeld_Studio\LFS_Stable\bin\LichtFeld-Studio.exe`
-- For queue debugging, the agent should capture evidence directly from:
-  - `plugin.queue.state`
-  - `plugin.queue.debug_events`
-  - `lichtfeld://runtime/state`
-  - `lichtfeld://runtime/events`
+- For queue debugging, the agent should capture evidence from the actual panel/runtime path, including:
+  - visible panel state and behavior
+  - local app logs
+  - repo trace artifacts such as `live_queue_debug_trace.jsonl`
+  - direct code inspection of the plugin and host LFS repo
 - The agent should not tell the user a fix is complete until it has personally run the relevant end-to-end flow and inspected the resulting evidence.
 - The agent should only stop and ask the user when:
   - sandbox or permission escalation is required
@@ -53,7 +81,7 @@ Preferred workflow for this repo:
 
 Current queue-specific expectation:
 
-- The agent should launch LFS itself when needed, run the queue verifier itself, inspect the stop point itself, patch only the observed failure, and rerun verification itself.
+- The agent should launch LFS itself when needed, run the real panel flow itself, inspect the stop point itself, patch only the observed failure, and rerun verification itself.
 - User interaction should be treated as exception handling, not the normal validation loop.
 
 ## Coding Style & Naming Conventions

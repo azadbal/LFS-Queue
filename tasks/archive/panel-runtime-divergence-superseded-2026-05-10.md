@@ -11,26 +11,22 @@
 - This is effectively the same user-visible failure the session started with.
 
 ## What Was Actually Verified
-- The underlying LFS MCP recipe flow works:
-  - `scene.load_dataset`
-  - `training.start`
-  - export flow
-- A specific MCP-driven queue execution path was also verified earlier:
+- A specific remote/debug-driven queue execution path was verified earlier:
   - job 1 loaded
   - job 1 trained
   - job 1 finalized
   - job 2 auto-started
   - job 2 trained/finalized
   - preserved models stayed visible in-scene during that same live session
-- That means some progress was real, but it was not sufficient for the normal panel-run path.
+- That means some progress was real, but it was not sufficient for the normal panel-run path and should not be treated as acceptance.
 
 ## Most Important New Suspicion
-- The live app currently shows both module trees loaded:
+- The live app reportedly showed both module trees loaded:
   - `lfs_queue.*`
   - `lfs_plugins.lfs_queue.*`
 - This is a serious red flag.
-- Strong suspicion: panel actions, MCP tools, and/or runtime callbacks are not all talking to the same controller singleton.
-- If true, that explains why an MCP-driven path could appear fixed while the panel-run path still stalls.
+- Strong suspicion: panel actions and runtime callbacks may not be talking to the same controller singleton.
+- If true, that explains why a remote/debug path could appear fixed while the panel-run path still stalls.
 
 ## Evidence
 - Live editor module listing showed both:
@@ -52,14 +48,14 @@
   - `python -m unittest discover -s tests -p "test_*.py"`
 
 ## What The Next Agent Needs To Do
-1. Reproduce the failure from the real `LFS Queue` panel, not from a seeded MCP-only harness.
+1. Reproduce the failure from the real `LFS Queue` panel, not from a seeded remote/debug harness.
 2. Inspect the stalled session directly:
-   - `plugin.queue.state`
-   - `plugin.queue.debug_events`
-   - `lichtfeld://runtime/state`
-3. Prove whether panel actions and MCP tools are using the same controller instance.
+   - visible panel state
+   - app logs
+   - `live_queue_debug_trace.jsonl`
+3. Prove whether panel actions and runtime callbacks are using the same controller instance.
 4. If not, fix module/controller canonicalization first.
-   - Goal: one true controller singleton for panel, MCP, and runtime callbacks.
+   - Goal: one true controller singleton for panel and runtime callbacks.
 5. Re-test the actual dogfooding flow:
    - load dataset normally
    - add 2 fresh jobs from panel
@@ -75,6 +71,5 @@
 - `__init__.py`
 - `panels/main_panel.py`
 - `queue_controller.py`
-- `queue_mcp.py`
 - `tasks/done/2026-04-04-queue-execution-and-preservation.md`
 - `tasks/planned/next-steps.md`

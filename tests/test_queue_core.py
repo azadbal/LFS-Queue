@@ -27,17 +27,17 @@ class QueueCoreTests(unittest.TestCase):
         self.assertEqual(sanitize_label("model: 1 / draft"), "model_1_draft")
 
     def test_next_model_name_uses_highest_existing_suffix(self) -> None:
-        self.assertEqual(next_model_name(["model 1", "Model 3", "variant"]), "model 4")
+        self.assertEqual(next_model_name(["model-1", "Model 3", "variant"]), "model-4")
 
     def test_make_job_output_dir_avoids_existing_queue_paths(self) -> None:
         output_dir = make_job_output_dir(
             "C:\\output",
-            "model 1",
+            "model-1",
             existing_paths=[],
-            path_exists=lambda path: str(path).endswith("model_1"),
+            path_exists=lambda path: str(path).endswith("model-1"),
         )
 
-        self.assertTrue(output_dir.endswith("model_1_2"))
+        self.assertTrue(output_dir.endswith("model-1_2"))
 
     def test_queue_state_round_trip_converts_transient_statuses(self) -> None:
         job = QueueJob.new(

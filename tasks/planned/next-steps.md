@@ -9,7 +9,7 @@
   - each job finalizes
   - completed models stay visible in-scene during the same session
   - the next job starts automatically
-  - queue status/debug events stay coherent without MCP-only inspection
+  - queue status/debug evidence comes from the real panel/runtime path, logs, and trace artifacts
 - During the dogfooding pass, note any UX friction:
   - confusing button flow
   - unclear status text
@@ -22,7 +22,7 @@
 - Add controller-focused regression tests for synchronous load readiness wait.
 - Add controller-focused regression tests for terminal training detection without hook delivery.
 - Add controller-focused regression tests for preserved-model restore on second job start.
-- Re-run the two-job GUI MCP acceptance flow after controller changes.
+- Re-run the two-job real GUI panel acceptance flow after controller changes.
 - Stress-test longer queues and larger datasets.
 - If config replay causes future parameter mismatches, narrow `_apply_job_config(job)` separately.
 - If viewport snapshots are needed later, prefer dataset-camera render paths over `render/current` until the upstream crash is resolved.
