@@ -32,7 +32,8 @@
 - [ ] Add timeout handling for "training requested but never started".
 - [ ] Add timeout handling for "finalization never completed".
 - [ ] Add a no-MCP CLI/scriptable queue runner for development and regression testing.
-- [ ] CLI runner should use COLMAP fixtures under `C:\Dev\3DGS\_example_datasets\COLMAP-ready-datasets\*\colmap`.
+- [ ] CLI runner should use COLMAP fixtures under `C:\Dev\3DGS\LFS-plugins\lfs-queue\_testingSplatArea\*\colmap`.
+- [ ] Keep `_testingSplatArea/` gitignored and out of commits.
 - [ ] CLI runner should write a machine-readable report plus plugin trace/log evidence.
 
 ## Priority 2: Basic Output Handling

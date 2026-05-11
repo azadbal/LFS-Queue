@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 
-DEFAULT_FIXTURE_ROOT = Path(r"C:\Dev\3DGS\_example_datasets\COLMAP-ready-datasets")
+DEFAULT_FIXTURE_ROOT = Path(__file__).resolve().parent / "_testingSplatArea"
 
 
 def discover_colmap_fixtures(root: str | Path = DEFAULT_FIXTURE_ROOT) -> list[str]:

@@ -2,6 +2,10 @@ __pycache__/
 *.pyc
 *.pyo
 
+# Local scan/testing datasets only. Never track or commit these.
+_testingSplatArea/
+testingaresplats/
+
 queue/
 *.ply
 *.spz

@@ -62,10 +62,10 @@ The first priority is a working bare-bones queue. Packaging the plugin so others
 - Core queue behavior should be unit-tested with a fake LFS adapter.
 - Real acceptance should be validated in LFS through visible UI behavior, app logs, plugin trace files, generated outputs, and loaded scene models.
 - For local dogfood testing, use ready COLMAP datasets under:
-  - `C:\Dev\3DGS\_example_datasets\COLMAP-ready-datasets`
+  - `C:\Dev\3DGS\LFS-plugins\lfs-queue\_testingSplatArea`
 - Choose a scene subfolder, then use its nested `colmap` folder. Known fixtures include:
-  - `C:\Dev\3DGS\_example_datasets\COLMAP-ready-datasets\ferry building drone\colmap`
-  - `C:\Dev\3DGS\_example_datasets\COLMAP-ready-datasets\360-hobart-short\colmap`
+  - `C:\Dev\3DGS\LFS-plugins\lfs-queue\_testingSplatArea\360-drone-example1\colmap`
+- `_testingSplatArea/` is intentionally gitignored and must not be committed or pushed.
 - The original single-fixture path was:
   - `C:\Dev\3DGS\_example_datasets\COLMAP-ready-datasets\ferry building drone\colmap`
 - These datasets are only validation fixtures. The plugin itself should still assume LFS is already ready to train for the panel workflow.

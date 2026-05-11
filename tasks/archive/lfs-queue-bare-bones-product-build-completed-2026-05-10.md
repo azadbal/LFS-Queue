@@ -1,7 +1,7 @@
 # LFS Queue Bare-Bones Product Build
 
-- Status: active
-- Last updated: 2026-05-10 queue artifact cleanup checkpoint
+- Status: done
+- Last updated: 2026-05-10 11:05 local time
 
 ## User ask
 
@@ -36,11 +36,11 @@
   - MCP is not an accepted dependency, implementation path, or verification path
   - the real acceptance path is the panel flow in a live LFS session
 - Concrete local dogfood dataset for agent-driven testing:
-  - Fixture root: `C:\Dev\3DGS\_example_datasets\COLMAP-ready-datasets`
+  - Fixture root: `C:\Dev\3DGS\LFS-plugins\lfs-queue\_testingSplatArea`
+  - `_testingSplatArea/` is intentionally gitignored and must not be committed or pushed.
   - Use a scene subfolder's nested `colmap` folder.
   - Currently discovered fixtures:
-    - `C:\Dev\3DGS\_example_datasets\COLMAP-ready-datasets\360-hobart-short\colmap`
-    - `C:\Dev\3DGS\_example_datasets\COLMAP-ready-datasets\ferry building drone\colmap`
+    - `C:\Dev\3DGS\LFS-plugins\lfs-queue\_testingSplatArea\360-drone-example1\colmap`
   - These paths are for verification setup only. The panel plugin itself should not own dataset import/loading as part of queue behavior.
 - The temporary yellow `HI` marker/button has been removed from the panel code.
 - Plugin path in LFS is a junction to this repo:
@@ -172,11 +172,9 @@
 
 ## Next recommended actions
 
-1. Re-run Nightly live verifier and confirm no duplicate live `Trained Model` remains after queue output reload.
-2. Confirm the base output has no top-level `splat_*.ply` after queue completion.
-3. Confirm each completed job has `queue\<job>\checkpoints\checkpoint.resume`.
-4. Keep strengthening the no-MCP verifier into a reusable CLI/scriptable regression command.
-5. Test with one changed setting between queued jobs so output comparison reflects distinct captured settings.
+1. Keep the Training-panel integration as planned follow-up work in `tasks/planned/add-to-queue-training-panel.md`.
+2. Keep queue report generation as planned follow-up work in `tasks/planned/add-queue-report-generation.md`.
+3. Continue using `_testingSplatArea/` for local live verification only; do not commit datasets or outputs from that area.
 
 ## Verification and back pressure plan
 
@@ -218,7 +216,6 @@
 ## Risks / blockers
 
 - The replay map is now explicit for this LFS build's supported `OptimizationParams` API, but future host changes could require keeping that map in sync.
-- Until the real panel flow passes, previous remote/debug verification should not be treated as acceptance.
 - The project may need a small host-side UI hook if the plugin cannot cleanly add `Add to Queue` near the native training controls from plugin code alone.
 - If trace evidence is too thin, agents will not be able to validate user-driven GUI runs after the fact.
 
@@ -245,4 +242,4 @@
 
 ## Last updated
 
-Queue artifact cleanup checkpoint: user verified the queue run and found expected queue outputs, plus a duplicate final live training model and ambiguous native top-level LFS artifacts. Patch now moves each job checkpoint into its job folder, removes ambiguous native top-level `splat_*.ply` files after saving named queue PLYs, and removes the final live training model before reloading completed queue outputs.
+Bare-bones queue build completed and archived. Remaining work was split into planned follow-ups for Training-panel integration and queue report generation. `_testingSplatArea/` is treated as local-only verification data and must stay out of git.

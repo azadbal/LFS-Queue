@@ -15,7 +15,7 @@ from .queue_controller import get_controller
 
 
 REPO_ROOT = Path(__file__).resolve().parent
-DEFAULT_DATASET = r"C:\Dev\3DGS\_example_datasets\COLMAP-ready-datasets\360-hobart-short\colmap"
+DEFAULT_DATASET = str(REPO_ROOT / "_testingSplatArea" / "360-drone-example1" / "colmap")
 
 
 def _env_path(name: str, default: str) -> str:

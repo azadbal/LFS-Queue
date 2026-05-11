@@ -28,7 +28,8 @@ LichtFeld Studio (LFS) installations used alongside this repository are stored o
 - Repo docs: `C:\Dev\3DGS\LichtFeld-Studio\docs`
 - LFS repo that you can build from source: `C:\Dev\3DGS\Lichtfeld-Studio-GH-REPO\LichtFeld-Studio`
 - General refs/docs: `C:\Dev\_docs`
-- example datasets to use to splat with: `C:\Dev\3DGS\_example_datasets\COLMAP-ready-datasets`
+- local splat testing datasets: `C:\Dev\3DGS\LFS-plugins\lfs-queue\_testingSplatArea`
+- `_testingSplatArea/` is intentionally gitignored; do not commit or push its datasets or generated outputs.
 
 Reference these exact paths in documentation or local workflow notes when a task depends on a specific build.
 
@@ -98,6 +99,8 @@ If you add executable code, include a `tests/` directory and name files `test_<f
 
 ## Commit & Pull Request Guidelines
 Git history is not available in this checkout, so use short imperative commit messages such as `Add second sample dataset` or `Document COLMAP output layout`. Keep each commit scoped to one logical change.
+
+Do not commit, push, create a pull request, or otherwise publish git changes unless the user explicitly asks for that action in the current conversation. This permission must be specific and direct, either in the user's message or via an invoked skill/workflow that clearly requests the git action. Do not infer permission to publish from requests to update files, fix bugs, validate behavior, or "update GitHub" wording alone.
 
 Pull requests should include a brief summary, affected dataset paths, validation steps performed, and screenshots only when a visual result changed.
 
