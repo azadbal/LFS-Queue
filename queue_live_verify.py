@@ -124,6 +124,51 @@ def _run_autorun_verify() -> None:
             raise RuntimeError(f"Failed to add job 2: {controller.status_message}")
 
         report["jobs_seeded"] = _serialize_jobs(controller)
+
+        first_job = controller.jobs[0]
+        if not controller.select_job(first_job.id):
+            raise RuntimeError("Failed to select job 1 for edit verification.")
+        if not controller.begin_edit_selected_job():
+            raise RuntimeError(f"Failed to begin editing job 1: {controller.status_message}")
+
+        edited_iterations = iterations + 5
+        optim.iterations = edited_iterations
+        dataset = lf.dataset_params()
+        original_resize_factor = getattr(dataset, "resize_factor", None)
+        if hasattr(dataset, "resize_factor"):
+            current_resize_factor = max(1, int(original_resize_factor or 1))
+            dataset.resize_factor = 2 if current_resize_factor == 1 else 1
+        if not controller.save_selected_job():
+            raise RuntimeError(f"Failed to save edited job 1: {controller.status_message}")
+
+        report["after_edit_save"] = {
+            "status_message": controller.status_message,
+            "state": controller.export_state(),
+            "jobs": _serialize_jobs(controller),
+            "edited_iterations": edited_iterations,
+        }
+
+        second_job = controller.jobs[1]
+        if not controller.select_job(second_job.id):
+            raise RuntimeError("Failed to select job 2 for remove verification.")
+        if not controller.delete_selected_job():
+            raise RuntimeError(f"Failed to remove job 2: {controller.status_message}")
+
+        report["after_remove"] = {
+            "status_message": controller.status_message,
+            "state": controller.export_state(),
+            "jobs": _serialize_jobs(controller),
+        }
+
+        optim.iterations = iterations + 1
+        if not controller.add_current_job():
+            raise RuntimeError(f"Failed to add replacement job after remove: {controller.status_message}")
+        report["after_readd"] = {
+            "status_message": controller.status_message,
+            "state": controller.export_state(),
+            "jobs": _serialize_jobs(controller),
+        }
+
         report["run_all_pending"] = bool(controller.run_all_pending())
         report["status_after_run"] = controller.status_message
         report["queue_completed"] = _wait_for_queue(controller, timeout_seconds, poll_seconds)

@@ -58,6 +58,10 @@ For runtime/training behavior, search the host repo for:
 - `training.stopped`
 - `dataset.load_completed`
 
+## Terms
+- In this repo, each item added to the queue is called a `job`.
+- Use `job` consistently in task notes, UI planning, and implementation discussions for queued entries.
+
 ## Low-Touch Execution
 Default expectation: the agent should handle build, test, live verification, evaluation, and iteration with minimal user involvement.
 
@@ -83,6 +87,8 @@ Preferred workflow for this repo:
 Current queue-specific expectation:
 
 - The agent should launch LFS itself when needed, run the real panel flow itself, inspect the stop point itself, patch only the observed failure, and rerun verification itself.
+- After any plugin panel UI change, the agent must verify that the actual `LFS Queue` tab opens and renders successfully in the live app. Queue autorun or controller-only verification is not enough on its own because panel draw code can fail even when runtime queue behavior still passes.
+- For immediate-mode UI changes, the agent should confirm the exact supported UI methods against the host repo stubs or source before using them. Do not assume generic helpers such as `ui.text(...)` exist on this surface without checking.
 - User interaction should be treated as exception handling, not the normal validation loop.
 
 ## Coding Style & Naming Conventions

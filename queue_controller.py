@@ -24,6 +24,7 @@ try:
         STATUS_FAILED,
         STATUS_INTERRUPTED,
         STATUS_LOADING,
+        STATUS_PENDING,
         STATUS_TRAINING,
         classify_training_end,
         deserialize_queue_state,
@@ -45,6 +46,7 @@ except ImportError:
         STATUS_FAILED,
         STATUS_INTERRUPTED,
         STATUS_LOADING,
+        STATUS_PENDING,
         STATUS_TRAINING,
         classify_training_end,
         deserialize_queue_state,
@@ -131,6 +133,8 @@ class QueueController:
         self._status_message = "Queue ready."
         self._auto_run = False
         self._active_job_id: str | None = None
+        self._selected_job_id: str | None = None
+        self._editing_job_id: str | None = None
         self._phase = "idle"
         self._stop_requested = False
         self._debug_events: list[dict[str, Any]] = []
@@ -164,11 +168,39 @@ class QueueController:
         return self.get_job_by_id(self._active_job_id)
 
     @property
+    def selected_job(self) -> QueueJob | None:
+        return self.get_job_by_id(self._selected_job_id)
+
+    @property
+    def editing_job(self) -> QueueJob | None:
+        return self.get_job_by_id(self._editing_job_id)
+
+    @property
     def is_running(self) -> bool:
         return self._active_job_id is not None
 
+    @property
+    def is_editing(self) -> bool:
+        return self.editing_job is not None
+
     def can_add_current_job(self) -> bool:
         return self._native_start_training_ready()
+
+    def can_edit_selected_job(self) -> bool:
+        job = self.selected_job
+        return bool(job is not None and not self.is_running and self._dataset_ready(job))
+
+    def can_remove_selected_job(self) -> bool:
+        return self.selected_job is not None and not self.is_running
+
+    def can_save_selected_job(self) -> bool:
+        job = self.selected_job
+        return bool(
+            job is not None
+            and self._editing_job_id == job.id
+            and not self.is_running
+            and self.can_add_current_job()
+        )
 
     def export_state(self) -> dict[str, Any]:
         state = build_runtime_state(
@@ -186,6 +218,8 @@ class QueueController:
                 "training_started_observed": self._training_started_observed,
                 "trainer_state": self._trainer_state(),
                 "finish_reason_baseline": self._finish_reason_baseline,
+                "selected_job_id": self._selected_job_id,
+                "editing_job_id": self._editing_job_id,
             }
         )
         return state
@@ -200,6 +234,103 @@ class QueueController:
         self._record_event("controller_shutdown")
         self._training_handlers.clear()
         self._release_frame_callback()
+
+    def select_job(self, job_id: str | None) -> bool:
+        if job_id and self.get_job_by_id(job_id) is None:
+            return False
+        if self._selected_job_id == job_id:
+            return False
+        self._selected_job_id = job_id
+        if self._editing_job_id and self._editing_job_id != self._selected_job_id:
+            self._editing_job_id = None
+        self._record_event("job_selected", job_id=job_id or "")
+        self._request_redraw()
+        return True
+
+    def begin_edit_selected_job(self) -> bool:
+        job = self.selected_job
+        if job is None:
+            self._set_status("Select a job first.", error=True)
+            return False
+        if self.is_running:
+            self._set_status("Stop the queue before editing a job.", error=True)
+            return False
+        if not self._dataset_ready(job):
+            self._set_status("Load the queued dataset before editing this job.", error=True)
+            return False
+
+        try:
+            self._load_job_into_current_settings(job)
+        except Exception as exc:
+            self._record_event("job_edit_begin_failed", job_id=job.id, label=job.label, error=str(exc))
+            self._set_status(f"Unable to load {job.label} into the current settings: {exc}", error=True)
+            return False
+
+        self._editing_job_id = job.id
+        self._record_event("job_edit_begin", job_id=job.id, label=job.label)
+        self._set_status(f"Editing {job.label}. Update LFS settings, then click Save.")
+        return True
+
+    def cancel_edit(self) -> bool:
+        job = self.editing_job
+        if job is None:
+            return False
+        self._editing_job_id = None
+        self._record_event("job_edit_cancelled", job_id=job.id, label=job.label)
+        self._set_status(f"Stopped editing {job.label}.")
+        return True
+
+    def save_selected_job(self) -> bool:
+        job = self.selected_job
+        if job is None or self._editing_job_id != job.id:
+            self._set_status("Select a job and click Edit before saving.", error=True)
+            return False
+        if self.is_running:
+            self._set_status("Stop the queue before saving job changes.", error=True)
+            return False
+        if not self.can_add_current_job():
+            self._set_status("Save is available when LFS Start Training is available.", error=True)
+            return False
+
+        try:
+            config_json = self._capture_current_config()
+            dataset_path, base_output_dir, dataset_overrides = self._capture_dataset_snapshot()
+        except Exception as exc:
+            self._record_event("job_save_failed", job_id=job.id, label=job.label, error=str(exc))
+            self._set_status(f"Unable to capture the edited settings: {exc}", error=True)
+            return False
+
+        previous_output_dir = job.job_output_dir
+        job.config_json = config_json
+        job.dataset_path = dataset_path
+        job.base_output_dir = base_output_dir
+        job.dataset_overrides = dataset_overrides
+        job.status = STATUS_PENDING
+        job.error = ""
+        job.last_run_at = ""
+        job.completed_at = ""
+        if self._canonical_base_output_dir(previous_output_dir) != base_output_dir:
+            taken_paths = [item.job_output_dir for item in self._jobs if item.id != job.id]
+            job.job_output_dir = make_job_output_dir(base_output_dir, job.model_name, taken_paths)
+        self._completed_output_paths.pop(job.id, None)
+        self._editing_job_id = None
+        self._persist()
+        self._record_event(
+            "job_saved",
+            job_id=job.id,
+            label=job.label,
+            dataset_path=job.dataset_path,
+            job_output_dir=job.job_output_dir,
+        )
+        self._set_status(f"Saved changes to {job.label}.")
+        return True
+
+    def delete_selected_job(self) -> bool:
+        job = self.selected_job
+        if job is None:
+            self._set_status("Select a job first.", error=True)
+            return False
+        return self.delete_job(job.id)
 
     def add_current_job(self) -> bool:
         ready = self.can_add_current_job()
@@ -286,6 +417,11 @@ class QueueController:
             return False
         if self._active_job_id == job_id:
             self.stop_queue()
+        if self._selected_job_id == job_id:
+            self._selected_job_id = None
+        if self._editing_job_id == job_id:
+            self._editing_job_id = None
+        self._completed_output_paths.pop(job_id, None)
         self._record_event("job_deleted", job_id=job_id)
         del self._jobs[index]
         self._persist()
@@ -308,6 +444,9 @@ class QueueController:
             return 0
         removed = len(self._jobs)
         self._jobs = []
+        self._selected_job_id = None
+        self._editing_job_id = None
+        self._completed_output_paths.clear()
         self._persist()
         self._record_event("queue_cleared", removed=removed)
         self._set_status(f"Cleared {removed} queued job(s)." if removed else "Queue already empty.")
@@ -695,6 +834,30 @@ class QueueController:
             optimization_skipped_keys=sorted(skipped_keys),
             skipped_errors=skipped_errors,
         )
+
+    def _load_job_into_current_settings(self, job: QueueJob) -> None:
+        temp_path = self._temp_json_path("edit")
+        try:
+            temp_path.write_text(json.dumps(job.config_json), encoding="utf-8")
+            lf.load_config_file(str(temp_path))
+        finally:
+            temp_path.unlink(missing_ok=True)
+
+        dataset = lf.dataset_params()
+        if hasattr(dataset, "output_path"):
+            try:
+                setattr(dataset, "output_path", job.base_output_dir)
+            except Exception:
+                pass
+        for name, value in job.dataset_overrides.items():
+            setattr(dataset, name, value)
+        self._record_event(
+            "job_settings_loaded",
+            job_id=job.id,
+            label=job.label,
+            dataset_override_keys=sorted(job.dataset_overrides.keys()),
+        )
+        self._request_redraw()
 
     def _apply_optimization_value(self, optimization: Any, name: str, value: Any) -> None:
         if name == "strategy":

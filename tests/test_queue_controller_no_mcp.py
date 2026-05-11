@@ -62,6 +62,7 @@ class FakeLichtfeld(types.ModuleType):
         self.dataset = _Dataset(str(Path(self.output_root.name) / "output"))
         self.optimization = _Optimization()
         self.training_starts = 0
+        self.load_config_calls = 0
         self.load_file_calls = 0
         self.remove_node_calls = []
         self.mcp_reads = 0
@@ -89,6 +90,13 @@ class FakeLichtfeld(types.ModuleType):
 
     def save_config_file(self, path: str) -> None:
         Path(path).write_text(json.dumps({"optimization": {"iterations": self.optimization.iterations}}), encoding="utf-8")
+
+    def load_config_file(self, path: str) -> None:
+        self.load_config_calls += 1
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+        optimization = payload.get("optimization") or {}
+        if "iterations" in optimization:
+            self.optimization.iterations = int(optimization["iterations"])
 
     def dataset_params(self) -> _Dataset:
         return self.dataset
@@ -217,6 +225,61 @@ class QueueControllerNoMcpTests(unittest.TestCase):
         self.assertFalse(native_checkpoint.exists())
         self.assertTrue((Path(job.job_output_dir) / "model-1.ply").exists())
         self.assertTrue((Path(job.job_output_dir) / "checkpoints" / "checkpoint.resume").exists())
+
+    def test_begin_edit_selected_job_loads_job_settings_without_dataset_reload(self) -> None:
+        controller = self.queue_controller.QueueController()
+        self.assertTrue(controller.add_current_job())
+        job = controller.jobs[0]
+        job.config_json = {"optimization": {"iterations": 321}}
+
+        self.fake_lf.optimization.iterations = 12
+        self.assertTrue(controller.select_job(job.id))
+        self.assertTrue(controller.begin_edit_selected_job())
+
+        self.assertEqual(controller.editing_job.id, job.id)
+        self.assertEqual(self.fake_lf.optimization.iterations, 321)
+        self.assertEqual(self.fake_lf.load_config_calls, 1)
+        self.assertEqual(self.fake_lf.load_file_calls, 0)
+
+    def test_save_selected_job_overwrites_existing_job(self) -> None:
+        controller = self.queue_controller.QueueController()
+        self.assertTrue(controller.add_current_job())
+        self.assertTrue(controller.add_current_job())
+        job = controller.jobs[0]
+        job.status = "failed"
+        job.error = "old error"
+        job.last_run_at = "2026-05-10T00:00:00+00:00"
+        job.completed_at = "2026-05-10T00:01:00+00:00"
+
+        self.assertTrue(controller.select_job(job.id))
+        self.assertTrue(controller.begin_edit_selected_job())
+        self.fake_lf.optimization.iterations = 77
+        self.fake_lf.dataset.resize_factor = 2
+
+        self.assertTrue(controller.save_selected_job())
+
+        self.assertEqual(len(controller.jobs), 2)
+        self.assertEqual(controller.jobs[0].id, job.id)
+        self.assertEqual(controller.jobs[0].config_json["optimization"]["iterations"], 77)
+        self.assertEqual(controller.jobs[0].dataset_overrides["resize_factor"], 2)
+        self.assertEqual(controller.jobs[0].status, "pending")
+        self.assertEqual(controller.jobs[0].error, "")
+        self.assertEqual(controller.jobs[0].last_run_at, "")
+        self.assertEqual(controller.jobs[0].completed_at, "")
+        self.assertIsNone(controller.editing_job)
+
+    def test_delete_selected_job_clears_selection_and_edit_state(self) -> None:
+        controller = self.queue_controller.QueueController()
+        self.assertTrue(controller.add_current_job())
+        job = controller.jobs[0]
+
+        self.assertTrue(controller.select_job(job.id))
+        self.assertTrue(controller.begin_edit_selected_job())
+        self.assertTrue(controller.delete_selected_job())
+
+        self.assertEqual(controller.jobs, [])
+        self.assertIsNone(controller.selected_job)
+        self.assertIsNone(controller.editing_job)
 
 
 if __name__ == "__main__":
